@@ -1,116 +1,135 @@
-"""Security scanner for agent skills."""
+"""Regex-based security scanner for supplementary detection."""
+
 import re
 from pathlib import Path
-from typing import List, Dict, Any
+from typing import Dict, List
 
-# Detection patterns: (regex, severity, type, description)
-PATTERNS = {
-    'shell': [
-        (r'\bos\.system\s*\(', 'HIGH', 'shell-exec', 'os.system() - command injection risk'),
-        (r'\bsubprocess\.(run|call|Popen)\s*\([^)]*shell\s*=\s*True', 'CRITICAL', 'shell-exec', 'subprocess with shell=True - command injection'),
-        (r'\beval\s*\(', 'CRITICAL', 'code-exec', 'eval() - arbitrary code execution'),
-        (r'\bexec\s*\(', 'CRITICAL', 'code-exec', 'exec() - arbitrary code execution'),
-        (r'`[^`]*\$', 'HIGH', 'shell-exec', 'Shell variable in backticks - injection risk'),
-        (r'\$\([^)]+\)', 'MEDIUM', 'shell-exec', 'Command substitution - check input sanitization'),
-    ],
-    'exfiltration': [
-        (r'requests\.(get|post)\s*\([^)]*\+', 'HIGH', 'exfil', 'HTTP request with concatenation - data exfil risk'),
-        (r'curl\s+[^|]*\$', 'HIGH', 'exfil', 'curl with variable - data exfiltration risk'),
-        (r'wget\s+[^|]*\$', 'HIGH', 'exfil', 'wget with variable - data exfiltration risk'),
-        (r'(api_key|password|secret|token)\s*=', 'MEDIUM', 'secret', 'Hardcoded secret - credential exposure'),
-        (r'\.env\b', 'LOW', 'env', 'Environment file access - check what\'s exposed'),
-    ],
-    'prompt_injection': [
-        (r'(read|cat|open)\s*\([^)]+\)\s*.*\.(prompt|send|complete)', 'HIGH', 'prompt-inject', 'File content passed to LLM - prompt injection surface'),
-        (r'user_input.*\.(prompt|message|content)', 'MEDIUM', 'prompt-inject', 'User input in prompt - potential injection'),
-    ],
-    'file_access': [
-        (r'open\s*\([^)]*["\']w', 'MEDIUM', 'file-write', 'File write operation - check path sanitization'),
-        (r'(rm|unlink|remove)\s+(-rf?\s+)?["\']?/', 'CRITICAL', 'destructive', 'Destructive file operation on absolute path'),
-        (r'chmod\s+777', 'HIGH', 'permissions', 'World-writable permissions'),
-        (r'sudo\b', 'HIGH', 'privilege', 'Sudo usage - privilege escalation'),
-    ],
-    'network': [
-        (r'0\.0\.0\.0', 'MEDIUM', 'network', 'Binding to all interfaces'),
-        (r'socket\.socket\s*\(', 'LOW', 'network', 'Raw socket usage'),
-    ],
-    'dependencies': [
-        (r'pip install\s+[^=]+$', 'MEDIUM', 'deps', 'Unpinned pip dependency'),
-        (r'npm install\s+[^@]+$', 'MEDIUM', 'deps', 'Unpinned npm dependency'),
-    ]
+# Patterns for detecting security issues via regex
+PATTERNS = [
+    # Hardcoded secrets and API keys
+    {
+        "pattern": re.compile(
+            r"""(?:api[_-]?key|apikey|secret[_-]?key|auth[_-]?token|access[_-]?token|password|passwd|pwd)\s*[=:]\s*['\"][^'\"]{8,}['\"]""",
+            re.IGNORECASE,
+        ),
+        "severity": "HIGH",
+        "category": "hardcoded-secret",
+        "message": "Possible hardcoded secret or API key",
+    },
+    # AWS keys
+    {
+        "pattern": re.compile(r"AKIA[0-9A-Z]{16}"),
+        "severity": "CRITICAL",
+        "category": "aws-key",
+        "message": "AWS Access Key ID detected",
+    },
+    # Private keys
+    {
+        "pattern": re.compile(r"-----BEGIN (?:RSA |DSA |EC )?PRIVATE KEY-----"),
+        "severity": "CRITICAL",
+        "category": "private-key",
+        "message": "Private key detected in source code",
+    },
+    # Credentials in URLs
+    {
+        "pattern": re.compile(
+            r"""[a-z]+://[^:]+:[^@]+@[^\s'\"]+""",
+            re.IGNORECASE,
+        ),
+        "severity": "HIGH",
+        "category": "credentials-in-url",
+        "message": "Credentials embedded in URL",
+    },
+    # Generic high-entropy strings that look like secrets
+    {
+        "pattern": re.compile(
+            r"""['\"][a-zA-Z0-9+/]{40,}['\"]"""
+        ),
+        "severity": "MEDIUM",
+        "category": "possible-secret",
+        "message": "High-entropy string that may be a secret",
+    },
+]
+
+# File extensions to scan with regex
+SCANNABLE_EXTENSIONS = {
+    ".py", ".js", ".ts", ".jsx", ".tsx", ".java", ".rb", ".php",
+    ".go", ".rs", ".c", ".cpp", ".h", ".hpp", ".cs", ".swift",
+    ".kt", ".scala", ".sh", ".bash", ".zsh", ".yaml", ".yml",
+    ".json", ".xml", ".toml", ".ini", ".cfg", ".conf", ".env",
 }
 
-# File extensions to scan
-SCAN_EXTENSIONS = {'.py', '.sh', '.bash', '.js', '.ts', '.md', '.yaml', '.yml', '.json'}
+# Files/directories to skip
+SKIP_PATTERNS = {
+    "__pycache__", ".git", ".svn", ".hg", "node_modules",
+    ".venv", "venv", ".env", "env", ".tox", ".pytest_cache",
+    ".mypy_cache", "dist", "build", "*.egg-info",
+}
 
 
-def scan_file(file_path: Path) -> List[Dict[str, Any]]:
-    """Scan a single file for security issues."""
+def should_scan_file(filepath: Path) -> bool:
+    """Check if a file should be scanned."""
+    # Skip hidden files and directories
+    for part in filepath.parts:
+        if part.startswith(".") and part not in (".env",):
+            return False
+        if part in SKIP_PATTERNS:
+            return False
+
+    # Check extension
+    return filepath.suffix.lower() in SCANNABLE_EXTENSIONS
+
+
+def scan_file_with_regex(filepath: Path) -> List[Dict]:
+    """
+    Scan a file for security issues using regex patterns.
+
+    Args:
+        filepath: Path to the file to scan
+
+    Returns:
+        List of findings
+    """
     findings = []
-    
+
     try:
-        content = file_path.read_text(errors='ignore')
-        lines = content.split('\n')
-    except Exception:
-        return findings
-    
-    for line_num, line in enumerate(lines, 1):
-        # Skip comments (basic)
-        stripped = line.strip()
-        if stripped.startswith('#') or stripped.startswith('//'):
-            continue
-            
-        for category, patterns in PATTERNS.items():
-            for pattern, severity, finding_type, description in patterns:
-                if re.search(pattern, line, re.IGNORECASE):
+        content = filepath.read_text(encoding="utf-8", errors="ignore")
+        lines = content.splitlines()
+
+        for line_num, line in enumerate(lines, start=1):
+            for pattern_info in PATTERNS:
+                if pattern_info["pattern"].search(line):
                     findings.append({
-                        'severity': severity,
-                        'type': finding_type,
-                        'category': category,
-                        'file': str(file_path),
-                        'line': line_num,
-                        'description': description,
-                        'snippet': line.strip()[:80]
+                        "file": str(filepath),
+                        "line": line_num,
+                        "severity": pattern_info["severity"],
+                        "category": pattern_info["category"],
+                        "message": pattern_info["message"],
                     })
-    
+    except (OSError, IOError):
+        pass
+
     return findings
 
 
-def scan_skill(skill_path: Path) -> List[Dict[str, Any]]:
-    """Scan an entire skill directory."""
+def scan_directory(directory: Path) -> List[Dict]:
+    """
+    Scan a directory for security issues using regex patterns.
+
+    Args:
+        directory: Path to the directory to scan
+
+    Returns:
+        List of findings
+    """
     findings = []
-    
-    if skill_path.is_file():
-        return scan_file(skill_path)
-    
-    for file_path in skill_path.rglob('*'):
-        if file_path.is_file() and file_path.suffix in SCAN_EXTENSIONS:
-            # Skip node_modules, venv, etc
-            if any(skip in str(file_path) for skip in ['node_modules', 'venv', '.venv', '__pycache__', '.git']):
-                continue
-            findings.extend(scan_file(file_path))
-    
-    # Sort by severity
-    severity_order = {'CRITICAL': 0, 'HIGH': 1, 'MEDIUM': 2, 'LOW': 3}
-    findings.sort(key=lambda x: severity_order.get(x['severity'], 99))
-    
+
+    if directory.is_file():
+        if should_scan_file(directory):
+            findings.extend(scan_file_with_regex(directory))
+    else:
+        for filepath in directory.rglob("*"):
+            if filepath.is_file() and should_scan_file(filepath):
+                findings.extend(scan_file_with_regex(filepath))
+
     return findings
-
-
-def get_security_score(findings: List[Dict[str, Any]]) -> int:
-    """Calculate a security score (0-100, higher is better)."""
-    if not findings:
-        return 100
-    
-    deductions = {
-        'CRITICAL': 30,
-        'HIGH': 15,
-        'MEDIUM': 5,
-        'LOW': 1
-    }
-    
-    score = 100
-    for f in findings:
-        score -= deductions.get(f['severity'], 0)
-    
-    return max(0, score)
